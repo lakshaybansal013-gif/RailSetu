@@ -1,4 +1,4 @@
-import { Booking, Passenger, WaitlistPriorityItem, CoachClass, QuotaType } from '../types';
+import { Booking, Passenger, WaitlistPriorityItem, CoachClass, QuotaType, BerthType } from '../types';
 import { INITIAL_MOCK_BOOKINGS, INITIAL_MOCK_WAITLIST } from '../mock/bookings';
 import { supabase, isMockMode } from './supabaseClient';
 import { allocateSinglePassengerToBerth } from '../algorithms/berthAllocation';
@@ -52,13 +52,48 @@ function saveWaitlist(waitlist: WaitlistPriorityItem[]): void {
 }
 
 function rowToBooking(row: Record<string, any>): Booking {
+  // Map passengers from joined 'passengers' table, or fallback to jsonb if present
+  let passengersList: Passenger[] = [];
+  if (Array.isArray(row.passengers)) {
+    passengersList = row.passengers.map((p: any) => ({
+      id: p.passenger_id ?? p.id,
+      name: p.name,
+      age: Number(p.age),
+      gender: p.gender,
+      berthPreference: p.berth_preference ?? p.berthPreference,
+      quota: p.quota,
+      seatAllocated: p.coach
+        ? {
+            coach: p.coach,
+            berthNumber: Number(p.berth_number),
+            berthType: p.berth_type as BerthType,
+          }
+        : p.seatAllocated,
+      status: p.status,
+      wlNumber: p.wl_number ? Number(p.wl_number) : p.wlNumber,
+      racNumber: p.rac_number ? Number(p.rac_number) : p.racNumber,
+    }));
+  }
+
+  // Payment method & txn from joined 'payments' table or direct column
+  const paymentRecord = Array.isArray(row.payments) && row.payments.length > 0 ? row.payments[0] : null;
+
   return {
-    pnr: row.pnr, trainNumber: row.train_number, trainName: row.train_name,
-    travelDate: row.travel_date, fromStation: row.from_station, toStation: row.to_station,
-    coachClass: row.coach_class, quota: row.quota, passengers: row.passengers,
-    totalFare: Number(row.total_fare), status: row.status, createdAt: row.created_at,
-    platformNumber: row.platform_number, paymentMethod: row.payment_method,
-    transactionId: row.transaction_id,
+    pnr: row.pnr,
+    trainNumber: row.train_number,
+    trainName: row.train_name,
+    travelDate: row.travel_date,
+    fromStation: row.from_station,
+    toStation: row.to_station,
+    coachClass: row.coach_class,
+    quota: row.quota,
+    passengers: passengersList,
+    totalFare: Number(row.total_fare),
+    status: row.status,
+    createdAt: row.created_at,
+    platformNumber: row.platform_number,
+    paymentMethod: paymentRecord?.payment_method ?? row.payment_method,
+    transactionId: paymentRecord?.transaction_id ?? row.transaction_id,
   } as Booking;
 }
 
@@ -79,7 +114,12 @@ export const bookingService = {
     if (isMockMode()) {
       return getStoredBookings();
     }
-    const { data, error } = await supabase.from('bookings').select('*').order('created_at', { ascending: false });
+    // Normalized relational query: joining passengers and payments
+    const { data, error } = await supabase
+      .from('bookings')
+      .select('*, passengers(*), payments(*)')
+      .order('created_at', { ascending: false });
+
     if (error) {
       throw new Error(`Unable to load bookings from Supabase: ${error.message}`);
     }
@@ -90,9 +130,14 @@ export const bookingService = {
     const cleanPnr = pnr.trim().replace(/\D/g, '');
     if (isMockMode()) {
       const all = getStoredBookings();
-      return all.find(b => b.pnr === cleanPnr || b.pnr.includes(cleanPnr));
+      return all.find((b) => b.pnr === cleanPnr || b.pnr.includes(cleanPnr));
     }
-    const { data, error } = await supabase.from('bookings').select('*').eq('pnr', cleanPnr).maybeSingle();
+    const { data, error } = await supabase
+      .from('bookings')
+      .select('*, passengers(*), payments(*)')
+      .eq('pnr', cleanPnr)
+      .maybeSingle();
+
     if (error) throw new Error(`Unable to look up booking: ${error.message}`);
     return data ? rowToBooking(data) : undefined;
   },
@@ -105,19 +150,19 @@ export const bookingService = {
     const pnr = Math.floor(1000000000 + Math.random() * 9000000000).toString();
 
     // Determine platform from train's stop info
-    const stopInfo = train?.stops.find(s => s.stationCode === params.fromStation);
+    const stopInfo = train?.stops.find((s) => s.stationCode === params.fromStation);
     const platformNumber = stopInfo?.platformNumber || Math.floor(1 + Math.random() * 5);
 
     // Identify station route indices for Activity Selection algorithm
-    const fromIdx = train ? train.stops.findIndex(s => s.stationCode === params.fromStation) : 0;
-    const toIdx = train ? train.stops.findIndex(s => s.stationCode === params.toStation) : 1;
+    const fromIdx = train ? train.stops.findIndex((s) => s.stationCode === params.fromStation) : 0;
+    const toIdx = train ? train.stops.findIndex((s) => s.stationCode === params.toStation) : 1;
 
     // Build existing berths map from previous confirmed bookings on this train
     const existingBerthIntervals: { berthId: number; intervals: any[] }[] = [];
     allBookings
-      .filter(b => b.trainNumber === params.trainNumber && b.status === 'CONFIRMED')
-      .forEach((b, bIdx) => {
-        b.passengers.forEach(p => {
+      .filter((b) => b.trainNumber === params.trainNumber && b.status === 'CONFIRMED')
+      .forEach((b) => {
+        b.passengers.forEach((p) => {
           if (p.seatAllocated) {
             existingBerthIntervals.push({
               berthId: p.seatAllocated.berthNumber,
@@ -163,7 +208,10 @@ export const bookingService = {
           id: passengerId,
           status: 'CONFIRMED',
           seatAllocated: {
-            coach: params.coachClass === 'CC' || params.coachClass === 'EC' ? `C${Math.floor(idx / 8) + 1}` : allocation.coach,
+            coach:
+              params.coachClass === 'CC' || params.coachClass === 'EC'
+                ? `C${Math.floor(idx / 8) + 1}`
+                : allocation.coach,
             berthNumber: allocation.berthId,
             berthType: p.berthPreference || allocation.berthType,
           },
@@ -179,8 +227,8 @@ export const bookingService = {
       }
     });
 
-    const isAllConfirmed = assignedPassengers.every(p => p.status === 'CONFIRMED');
-    const hasRac = assignedPassengers.some(p => p.status === 'RAC');
+    const isAllConfirmed = assignedPassengers.every((p) => p.status === 'CONFIRMED');
+    const hasRac = assignedPassengers.some((p) => p.status === 'RAC');
     const bookingStatus: 'CONFIRMED' | 'RAC' | 'WAITLISTED' = isAllConfirmed
       ? 'CONFIRMED'
       : hasRac
@@ -189,6 +237,7 @@ export const bookingService = {
 
     const farePerTicket = classInfo?.fare || 1250;
     const totalFare = farePerTicket * assignedPassengers.length;
+    const transactionId = `TXN${Date.now()}`;
 
     const newBooking: Booking = {
       pnr,
@@ -205,30 +254,71 @@ export const bookingService = {
       createdAt: new Date().toISOString(),
       platformNumber,
       paymentMethod: params.paymentMethod,
-      transactionId: `TXN${Date.now()}`,
+      transactionId,
     };
 
     allBookings.unshift(newBooking);
+
     if (isMockMode()) {
       saveBookings(allBookings);
     } else {
       const user = (await supabase.auth.getUser()).data.user;
-      const { error } = await supabase.from('bookings').insert({
-        pnr, user_id: user?.id ?? null, train_number: params.trainNumber, train_name: params.trainName,
-        travel_date: params.travelDate, from_station: params.fromStation, to_station: params.toStation,
-        coach_class: params.coachClass, quota: params.quota, passengers: assignedPassengers,
-        total_fare: totalFare, status: bookingStatus, platform_number: platformNumber,
-        payment_method: newBooking.paymentMethod, transaction_id: newBooking.transactionId,
+
+      // 1. Insert into normalized 'bookings' table
+      const { error: bookingErr } = await supabase.from('bookings').insert({
+        pnr,
+        user_id: user?.id ?? null,
+        train_number: params.trainNumber,
+        train_name: params.trainName,
+        travel_date: params.travelDate,
+        from_station: params.fromStation,
+        to_station: params.toStation,
+        coach_class: params.coachClass,
+        quota: params.quota,
+        total_fare: totalFare,
+        status: bookingStatus,
+        platform_number: platformNumber,
       });
-      if (error) throw new Error(`Unable to create booking: ${error.message}`);
+
+      if (bookingErr) throw new Error(`Unable to create booking: ${bookingErr.message}`);
+
+      // 2. Insert into normalized 'passengers' table
+      const passengerRows = assignedPassengers.map((p) => ({
+        booking_pnr: pnr,
+        name: p.name,
+        age: p.age,
+        gender: p.gender,
+        berth_preference: p.berthPreference ?? null,
+        quota: p.quota || params.quota || 'GN',
+        coach: p.seatAllocated?.coach ?? null,
+        berth_number: p.seatAllocated?.berthNumber ?? null,
+        berth_type: p.seatAllocated?.berthType ?? null,
+        status: p.status,
+        wl_number: p.wlNumber ?? null,
+        rac_number: p.racNumber ?? null,
+      }));
+
+      const { error: passErr } = await supabase.from('passengers').insert(passengerRows);
+      if (passErr) {
+        console.error('Error inserting passengers to relational table:', passErr);
+        throw new Error(`Unable to save passenger details: ${passErr.message}`);
+      }
+
+      // 3. Insert into normalized 'payments' table
+      const { error: payErr } = await supabase.from('payments').insert({
+        booking_pnr: pnr,
+        transaction_id: transactionId,
+        amount: totalFare,
+        payment_method: params.paymentMethod,
+        status: 'SUCCESS',
+      });
+      if (payErr) console.warn('Could not insert payment to relational table:', payErr.message);
     }
 
     return newBooking;
   },
 
-  async cancelBooking(
-    pnr: string
-  ): Promise<{
+  async cancelBooking(pnr: string): Promise<{
     cancelledBooking: Booking;
     refundAmount: number;
     cancellationCharge: number;
@@ -236,7 +326,7 @@ export const bookingService = {
     promotedPassengers: WaitlistPriorityItem[];
   }> {
     const allBookings = await this.getAllBookings();
-    const bookingIndex = allBookings.findIndex(b => b.pnr === pnr);
+    const bookingIndex = allBookings.findIndex((b) => b.pnr === pnr);
 
     if (bookingIndex === -1) {
       throw new Error(`Booking with PNR ${pnr} not found.`);
@@ -257,17 +347,23 @@ export const bookingService = {
     // Update booking status
     booking.status = 'CANCELLED';
     allBookings[bookingIndex] = booking;
+
     if (isMockMode()) {
       saveBookings(allBookings);
     } else {
-      const { error } = await supabase.from('bookings').update({ status: 'CANCELLED' })
-        .eq('pnr', pnr).neq('status', 'CANCELLED');
+      const { error } = await supabase
+        .from('bookings')
+        .update({ status: 'CANCELLED' })
+        .eq('pnr', pnr)
+        .neq('status', 'CANCELLED');
       if (error) throw new Error(`Unable to cancel booking: ${error.message}`);
+
+      // Update passengers status as well in normalized table
+      await supabase.from('passengers').update({ status: 'CANCELLED' }).eq('booking_pnr', pnr);
     }
 
-    // GREEDY WAITLIST PROMOTION:
-    // When confirmed seats are released, promote waitlisted passengers using Max-Heap Priority Queue!
-    const seatsReleased = booking.passengers.filter(p => p.status === 'CONFIRMED').length;
+    // GREEDY WAITLIST PROMOTION
+    const seatsReleased = booking.passengers.filter((p) => p.status === 'CONFIRMED').length;
     let promotedPassengers: WaitlistPriorityItem[] = [];
 
     if (seatsReleased > 0) {
