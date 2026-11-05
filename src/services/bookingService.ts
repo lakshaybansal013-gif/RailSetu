@@ -289,7 +289,7 @@ export const bookingService = {
         age: p.age,
         gender: p.gender,
         berth_preference: p.berthPreference ?? null,
-        quota: p.quota,
+        quota: p.quota || params.quota || 'GN',
         coach: p.seatAllocated?.coach ?? null,
         berth_number: p.seatAllocated?.berthNumber ?? null,
         berth_type: p.seatAllocated?.berthType ?? null,
@@ -299,7 +299,10 @@ export const bookingService = {
       }));
 
       const { error: passErr } = await supabase.from('passengers').insert(passengerRows);
-      if (passErr) console.warn('Could not insert passengers to relational table:', passErr.message);
+      if (passErr) {
+        console.error('Error inserting passengers to relational table:', passErr);
+        throw new Error(`Unable to save passenger details: ${passErr.message}`);
+      }
 
       // 3. Insert into normalized 'payments' table
       const { error: payErr } = await supabase.from('payments').insert({
